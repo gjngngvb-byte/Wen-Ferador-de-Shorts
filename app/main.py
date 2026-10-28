@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.5")
+app = FastAPI(title=APP, version="0.2.6")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -119,8 +119,13 @@ async def click_largest_video_option(page):
             "Texto visível na página: " + repr(body)
         )
 
-    # Seleciona a última opção de vídeo exibida, conforme solicitado.
+    # Prioriza a opção exata 1080p MP4; se não existir, usa a última opção de vídeo disponível.
     option, description = candidates[-1]
+    for candidate in candidates:
+        normalized = re.sub(r"\s+", " ", candidate[1]).strip()
+        if re.fullmatch(r"1080p\s*MP4", normalized, re.I):
+            option, description = candidate
+            break
     context = page.context
     popup_pages = []
     context.on("page", lambda new_page: popup_pages.append(new_page))
@@ -329,7 +334,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.5", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.2.6", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

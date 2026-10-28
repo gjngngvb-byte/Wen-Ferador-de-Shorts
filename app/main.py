@@ -16,7 +16,7 @@ ENGINE=os.getenv("WENCLIPS_ENGINE_URL","https://wenclips-engine.onrender.com").r
 jobs: dict[str,dict[str,Any]]={}
 lock=asyncio.Lock()
 worker=asyncio.Lock()
-app=FastAPI(title=APP,version="0.2.0")
+app=FastAPI(title=APP,version="0.2.1")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["GET","POST","OPTIONS"],allow_headers=["*"])
 
 class Start(BaseModel):
@@ -35,7 +35,7 @@ async def update(jid:str,**kw):
 async def first_visible(locators):
     for locator in locators:
         try:
-            for i in range(min(await locator.count(),8)):
+            for i in range(min(await locator.count(),12)):
                 x=locator.nth(i)
                 if await x.is_visible() and await x.is_enabled(): return x
         except Exception: pass
@@ -59,13 +59,21 @@ async def download_from_noadsdl(url:str,target:Path):
         page=await context.new_page(); page.set_default_timeout(timeout)
         try:
             await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1800)
+            # Do not use get_by_label here: the page labels a whole section as "search box",
+            # so Playwright may resolve a SECTION rather than an editable field.
             field=await first_visible([
-                page.get_by_label(re.compile("youtube|video|url|link",re.I)),
-                page.locator('input[type="url"]'),page.locator('input[placeholder*="YouTube" i]'),
-                page.locator('input[placeholder*="URL" i]'),page.locator('input[type="text"]'),page.locator("textarea")
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
             ])
-            if not field: raise RuntimeError("Não encontrei o campo para colar o link no NoAdsDL.")
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado. Copie esta mensagem e envie para diagnóstico.")
+            tag=await field.evaluate("(el) => el.tagName.toLowerCase()")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable:
+                raise RuntimeError(f"O seletor do NoAdsDL encontrou um elemento não editável ({tag}); download cancelado para evitar preencher o elemento errado.")
             await field.fill(url)
             await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|avaliar formatos|formatos disponíveis",re.I)])
             await page.wait_for_load_state("domcontentloaded",timeout=20000)
@@ -112,7 +120,7 @@ async def run_job(jid:str,url:str):
 @app.get("/",include_in_schema=False)
 def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
 @app.get("/health")
-def health(): return {"ok":True,"service":APP,"version":"0.2.0","wenclips_engine":ENGINE}
+def health(): return {"ok":True,"service":APP,"version":"0.2.1","wenclips_engine":ENGINE}
 @app.post("/api/jobs",status_code=202)
 async def create_job(payload:Start):
     url=valid_url(payload.url); jid=uuid.uuid4().hex

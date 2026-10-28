@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.6")
+app = FastAPI(title=APP, version="0.2.7")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -216,7 +216,8 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
         page.on("response", record_bad_response)
         page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if "noadsdl.com/api/" in req.url.lower() and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/")) else None)
         try:
-            await page.goto("https://noadsdl.com/", wait_until="domcontentloaded", timeout=timeout)
+            # Abre diretamente a ferramenta de vídeo, evitando a etapa intermediária da página inicial.
+            await page.goto("https://noadsdl.com/save-youtube-video-online", wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1800)
             field = await first_visible([
                 page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
@@ -233,9 +234,11 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                 raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
             await field.fill(url)
             await click_named(page, [
+                re.compile(r"show mp4\s*&\s*mp3 formats", re.I),
+                re.compile(r"show formats", re.I),
                 re.compile(r"extract formats", re.I),
                 re.compile(r"continue to available formats", re.I),
-                re.compile(r"available formats|show formats|formatos disponíveis", re.I),
+                re.compile(r"available formats|formatos disponíveis", re.I),
             ])
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=20000)
@@ -334,7 +337,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.6", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.2.7", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

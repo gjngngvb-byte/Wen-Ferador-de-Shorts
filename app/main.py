@@ -72,9 +72,7 @@ async def click_largest_video_option(page):
             ])).strip().replace("\\n"," ")
             if not resolution.search(text): continue
             if len(text)>100 or "?" in text or re.search(r'\\b(why|faq|longer|take longer|audio|mp3|only audio|learn more|support)\\b',text,re.I): continue
-            # The FAQ entries are large accordion cards, not format choices.
-            if await el.evaluate("(e)=>e.closest('details, summary, article, footer') !== null").catch(lambda _: False): 
-                continue
+            # Text-based exclusion above prevents FAQ headings from being treated as formats.
             candidates.append((el,text[:100],tag))
         except Exception: continue
     if not candidates:

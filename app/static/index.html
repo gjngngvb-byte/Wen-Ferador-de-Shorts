@@ -5,10 +5,39 @@
 </style></head><body><main><div class="tag">WenClips · ponte de download</div><h1>Do YouTube para Shorts.</h1><p>Cole um link de um vídeo que você tem autorização para baixar e reutilizar. A ponte tenta usar o NoAdsDL e envia o vídeo ao processamento do WenClips.</p>
 <form id="form"><label for="url">Link do YouTube</label><input id="url" type="url" placeholder="https://www.youtube.com/watch?v=..." required maxlength="2048"><button id="submit">Baixar e enviar ao WenClips</button></form><div class="status-wrap"><div id="status" class="status" role="status" aria-live="polite">Pronto para começar.</div><div class="copy-row"><button type="button" id="copy-status" class="copy-btn" aria-label="Copiar toda a mensagem de status">▢ Copiar mensagem</button></div></div><p class="small">A interface do NoAdsDL pode mudar ou bloquear automação. Não contorna login, CAPTCHA ou controles de acesso. O arquivo temporário é apagado após o envio ou em caso de falha.</p></main>
 <script>
-const form=document.querySelector("#form"),input=document.querySelector("#url"),button=document.querySelector("#submit"),box=document.querySelector("#status"),copyButton=document.querySelector("#copy-status");
+const form=document.querySelector("#form");
+const input=document.querySelector("#url");
+const button=document.querySelector("#submit");
+const box=document.querySelector("#status");
+const copyButton=document.querySelector("#copy-status");
 let lastFullMessage="Pronto para começar.";
-function showMessage(message){lastFullMessage=String(message);box.textContent=lastFullMessage;
-copyButton.addEventListener("click",async()=>{try{await navigator.clipboard.writeText(lastFullMessage);copyButton.textContent="✓ Mensagem copiada";}catch{const area=document.createElement("textarea");area.value=lastFullMessage;area.style.position="fixed";area.style.opacity="0";document.body.appendChild(area);area.select();const ok=document.execCommand("copy");area.remove();copyButton.textContent=ok?"✓ Mensagem copiada":"Não foi possível copiar";}setTimeout(()=>copyButton.textContent="▢ Copiar mensagem",2200);});
+function showMessage(message){lastFullMessage=String(message);box.textContent=lastFullMessage;}
+copyButton.addEventListener("click",async()=>{
+  try {
+    await navigator.clipboard.writeText(lastFullMessage);
+    copyButton.textContent="✓ Mensagem copiada";
+  } catch {
+    const area=document.createElement("textarea");
+    area.value=lastFullMessage;area.style.position="fixed";area.style.opacity="0";
+    document.body.appendChild(area);area.select();
+    const ok=document.execCommand("copy");area.remove();
+    copyButton.textContent=ok?"✓ Mensagem copiada":"Não foi possível copiar";
+  }
+  setTimeout(()=>copyButton.textContent="▢ Copiar mensagem",2200);
+});
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
-form.addEventListener("submit",async e=>{e.preventDefault();button.disabled=true;showMessage("Iniciando…");try{const r=await fetch("/api/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:input.value.trim()})});const d=await r.json();if(!r.ok)throw Error(d.detail||"Não foi possível iniciar");for(let i=0;i<360;i++){await wait(3000);const s=await fetch(d.status_url);const j=await s.json();showMessage((j.message||j.status)+"\nStatus: "+j.status+"\nProgresso: "+(j.progress||0)+"%"+(j.error?"\n\n"+j.error:""));if(["submitted","failed"].includes(j.status))break;}}catch(err){showMessage("Erro: "+err.message);}finally{button.disabled=false;}});
+form.addEventListener("submit",async e=>{
+  e.preventDefault();button.disabled=true;showMessage("Iniciando…");
+  try {
+    const r=await fetch("/api/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:input.value.trim()})});
+    const d=await r.json();if(!r.ok)throw Error(d.detail||"Não foi possível iniciar");
+    for(let i=0;i<360;i++){
+      await wait(3000);
+      const s=await fetch(d.status_url);const j=await s.json();
+      showMessage((j.message||j.status)+"\nStatus: "+j.status+"\nProgresso: "+(j.progress||0)+"%"+(j.error?"\n\n"+j.error:""));
+      if(["submitted","failed"].includes(j.status))break;
+    }
+  } catch(err) { showMessage("Erro: "+err.message); }
+  finally { button.disabled=false; }
+});
 </script></body></html>

@@ -52,46 +52,83 @@ async def click_named(page, patterns, roles=("button","link")):
     raise RuntimeError("Não encontrei o botão esperado no NoAdsDL. A interface pode ter mudado ou a página pode ter bloqueado a automação.")
 
 async def click_largest_video_option(page):
-    # The site's available video formats are listed as options; the user confirmed
-    # the highest-resolution video is the final option, not a literal "largest resolution" button.
-    await page.wait_for_timeout(1800)
+    # Ignore FAQ accordions and explanatory copy; only accept short, actionable format labels.
+    await page.wait_for_timeout(2500)
+    resolution=re.compile(r'(?<!\\d)(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p\\b|\\b(?:4k|8k)\\b',re.I)
     candidates=[]
     locator=page.locator('a, button, [role="button"], input[type="radio"], label')
-    try:
-        count=min(await locator.count(),500)
-    except Exception:
-        count=0
-    resolution=re.compile(r'(?<!\d)(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\s*p\b|\b(?:4k|8k)\b',re.I)
+    try: count=min(await locator.count(),500)
+    except Exception: count=0
     for i in range(count):
         el=locator.nth(i)
         try:
             if not await el.is_visible() or not await el.is_enabled(): continue
             tag=await el.evaluate("(e)=>e.tagName.toLowerCase()")
-            if tag=="input":
-                text=" ".join(filter(None,[await el.get_attribute("value"),await el.get_attribute("aria-label"),await el.get_attribute("title")]))
-            else:
-                text=" ".join(filter(None,[(await el.inner_text())[:250],await el.get_attribute("aria-label"),await el.get_attribute("title")]))
+            text=" ".join(filter(None,[
+                (await el.inner_text())[:160] if tag!="input" else "",
+                await el.get_attribute("value"),
+                await el.get_attribute("aria-label"),
+                await el.get_attribute("title")
+            ])).strip().replace("\\n"," ")
             if not resolution.search(text): continue
-            if re.search(r'\baudio\b|\bmp3\b|\bonly audio\b',text,re.I): continue
-            candidates.append((el,text.strip().replace("\n"," ")[:140]))
+            if len(text)>100 or "?" in text or re.search(r'\\b(why|faq|longer|take longer|audio|mp3|only audio|learn more|support)\\b',text,re.I): continue
+            # The FAQ entries are large accordion cards, not format choices.
+            if await el.evaluate("(e)=>e.closest('details, summary, article, footer') !== null").catch(lambda _: False): 
+                continue
+            candidates.append((el,text[:100],tag))
         except Exception: continue
     if not candidates:
-        raise RuntimeError("A lista de formatos abriu, mas não consegui identificar opções de vídeo com resolução (ex.: 720p/1080p). Copie esta mensagem e envie para diagnóstico.")
-    # Last resolution-bearing clickable option is the highest video option per the site's ordering.
-    el,description=candidates[-1]
+        raise RuntimeError("Não encontrei uma opção real de formato de vídeo (ex.: botão 720p/1080p). A página pode não ter carregado os formatos. Copie esta mensagem para diagnóstico.")
+    # User confirmed the final actual format option is the highest resolution.
+    option,description,tag=candidates[-1]
+    popup_pages=[]
+    context=page.context
+    context.on("page", lambda p: popup_pages.append(p))
     try:
-        async with page.expect_download(timeout=60000) as info:
-            if await el.evaluate("(e)=>e.tagName.toLowerCase()")=="input":
-                await el.check(timeout=15000)
-                parent=el.locator("xpath=..")
-                try: await parent.click(timeout=5000)
-                except Exception: pass
-            else:
-                await el.click(timeout=20000)
-        dl=await info.value
-        return dl,description
-    except PlaywrightTimeoutError as e:
-        raise RuntimeError(f"Selecionei a última opção de vídeo encontrada ({description}), mas o NoAdsDL não iniciou o download. A página pode abrir o link em outra aba ou exigir outra ação.") from e
+        await option.click(timeout=20000)
+    except Exception as e:
+        raise RuntimeError(f"Encontrei a opção {description}, mas não consegui selecioná-la: {str(e)[:250]}")
+    await page.wait_for_timeout(1200)
+    active_pages=[p for p in popup_pages if not p.is_closed()]
+    targets=active_pages+[page]
+    # Some format options only select a quality; a separate Download button starts the transfer.
+    download_patterns=[
+        re.compile(r'^download(?: video)?(?: mp4)?$',re.I),
+        re.compile(r'^download now$',re.I),
+        re.compile(r'^prepare download$',re.I),
+        re.compile(r'^get video$',re.I),
+        re.compile(r'^save video$',re.I),
+        re.compile(r'^download file$',re.I),
+    ]
+    last_error=None
+    for target in targets:
+        for pattern in download_patterns:
+            for role in ("button","link"):
+                try:
+                    button=target.get_by_role(role,name=pattern).first
+                    if not await button.count() or not await button.is_visible() or not await button.is_enabled(): continue
+                    try:
+                        async with target.expect_download(timeout=45000) as info:
+                            await button.click(timeout=15000)
+                        dl=await info.value
+                        return dl,description
+                    except PlaywrightTimeoutError as e:
+                        last_error=e
+                        # If download opens in a new tab, inspect that tab before failing.
+                        await target.wait_for_timeout(1500)
+                        new_pages=[p for p in popup_pages if not p.is_closed() and p not in targets]
+                        for new_page in new_pages:
+                            targets.insert(0,new_page)
+                except Exception as e:
+                    last_error=e
+    # Some providers start downloading immediately when the format itself is clicked.
+    # Retry click with download expectation only on the actual format option.
+    try:
+        async with page.expect_download(timeout=12000) as info:
+            await option.click(timeout=5000)
+        return await info.value,description
+    except Exception as e:
+        raise RuntimeError(f"Selecionei a opção de vídeo {description}, mas não encontrei/iniciei a ação real de download. A opção pode apenas selecionar a qualidade ou abrir outra etapa. URL atual: {page.url}. Texto visível: {(await page.locator('body').inner_text())[:700]!r}") from (last_error or e)
 
 async def download_from_noadsdl(url:str,target:Path):
     timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))

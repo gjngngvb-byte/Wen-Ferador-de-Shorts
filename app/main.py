@@ -16,7 +16,7 @@ ENGINE=os.getenv("WENCLIPS_ENGINE_URL","https://wenclips-engine.onrender.com").r
 jobs: dict[str,dict[str,Any]]={}
 lock=asyncio.Lock()
 worker=asyncio.Lock()
-app=FastAPI(title=APP,version="0.2.1")
+app=FastAPI(title=APP,version="0.2.2")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["GET","POST","OPTIONS"],allow_headers=["*"])
 
 class Start(BaseModel):
@@ -51,6 +51,48 @@ async def click_named(page, patterns, roles=("button","link")):
             except Exception: pass
     raise RuntimeError("Não encontrei o botão esperado no NoAdsDL. A interface pode ter mudado ou a página pode ter bloqueado a automação.")
 
+async def click_largest_video_option(page):
+    # The site's available video formats are listed as options; the user confirmed
+    # the highest-resolution video is the final option, not a literal "largest resolution" button.
+    await page.wait_for_timeout(1800)
+    candidates=[]
+    locator=page.locator('a, button, [role="button"], input[type="radio"], label')
+    try:
+        count=min(await locator.count(),500)
+    except Exception:
+        count=0
+    resolution=re.compile(r'(?<!\d)(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\s*p\b|\b(?:4k|8k)\b',re.I)
+    for i in range(count):
+        el=locator.nth(i)
+        try:
+            if not await el.is_visible() or not await el.is_enabled(): continue
+            tag=await el.evaluate("(e)=>e.tagName.toLowerCase()")
+            if tag=="input":
+                text=" ".join(filter(None,[await el.get_attribute("value"),await el.get_attribute("aria-label"),await el.get_attribute("title")]))
+            else:
+                text=" ".join(filter(None,[(await el.inner_text())[:250],await el.get_attribute("aria-label"),await el.get_attribute("title")]))
+            if not resolution.search(text): continue
+            if re.search(r'\baudio\b|\bmp3\b|\bonly audio\b',text,re.I): continue
+            candidates.append((el,text.strip().replace("\n"," ")[:140]))
+        except Exception: continue
+    if not candidates:
+        raise RuntimeError("A lista de formatos abriu, mas não consegui identificar opções de vídeo com resolução (ex.: 720p/1080p). Copie esta mensagem e envie para diagnóstico.")
+    # Last resolution-bearing clickable option is the highest video option per the site's ordering.
+    el,description=candidates[-1]
+    try:
+        async with page.expect_download(timeout=60000) as info:
+            if await el.evaluate("(e)=>e.tagName.toLowerCase()")=="input":
+                await el.check(timeout=15000)
+                parent=el.locator("xpath=..")
+                try: await parent.click(timeout=5000)
+                except Exception: pass
+            else:
+                await el.click(timeout=20000)
+        dl=await info.value
+        return dl,description
+    except PlaywrightTimeoutError as e:
+        raise RuntimeError(f"Selecionei a última opção de vídeo encontrada ({description}), mas o NoAdsDL não iniciou o download. A página pode abrir o link em outra aba ou exigir outra ação.") from e
+
 async def download_from_noadsdl(url:str,target:Path):
     timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
     async with async_playwright() as p:
@@ -60,8 +102,6 @@ async def download_from_noadsdl(url:str,target:Path):
         try:
             await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
             await page.wait_for_timeout(1800)
-            # Do not use get_by_label here: the page labels a whole section as "search box",
-            # so Playwright may resolve a SECTION rather than an editable field.
             field=await first_visible([
                 page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
                 page.locator('textarea:not([disabled])'),
@@ -69,27 +109,14 @@ async def download_from_noadsdl(url:str,target:Path):
                 page.locator('[role="textbox"]:not([aria-readonly="true"])')
             ])
             if not field:
-                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado. Copie esta mensagem e envie para diagnóstico.")
-            tag=await field.evaluate("(el) => el.tagName.toLowerCase()")
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
             editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
-            if not editable:
-                raise RuntimeError(f"O seletor do NoAdsDL encontrou um elemento não editável ({tag}); download cancelado para evitar preencher o elemento errado.")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
             await field.fill(url)
-            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|avaliar formatos|formatos disponíveis",re.I)])
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
             await page.wait_for_load_state("domcontentloaded",timeout=20000)
-            await page.wait_for_timeout(1200)
-            largest=await first_visible([
-                page.get_by_role("button",name=re.compile("largest resolution|highest resolution|best quality|maior resolução|melhor qualidade",re.I)),
-                page.get_by_role("link",name=re.compile("largest resolution|highest resolution|best quality|maior resolução|melhor qualidade",re.I)),
-                page.get_by_text(re.compile("the largest resolution|largest resolution|highest resolution|maior resolução|melhor qualidade",re.I))
-            ])
-            if not largest: raise RuntimeError("Não encontrei 'A maior resolução' no NoAdsDL.")
-            try:
-                async with page.expect_download(timeout=60000) as info:
-                    await largest.click(timeout=20000)
-                dl=await info.value; await dl.save_as(str(target))
-            except PlaywrightTimeoutError as e:
-                raise RuntimeError("O NoAdsDL não iniciou um download de navegador após selecionar a maior resolução.") from e
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
         finally:
             await context.close(); await browser.close()
     if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
@@ -120,7 +147,7 @@ async def run_job(jid:str,url:str):
 @app.get("/",include_in_schema=False)
 def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
 @app.get("/health")
-def health(): return {"ok":True,"service":APP,"version":"0.2.1","wenclips_engine":ENGINE}
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
 @app.post("/api/jobs",status_code=202)
 async def create_job(payload:Start):
     url=valid_url(payload.url); jid=uuid.uuid4().hex

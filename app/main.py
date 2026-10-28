@@ -54,7 +54,7 @@ async def click_named(page, patterns, roles=("button","link")):
 async def click_largest_video_option(page):
     # Ignore FAQ accordions and explanatory copy; only accept short, actionable format labels.
     await page.wait_for_timeout(2500)
-    resolution=re.compile(r'(?<!\\d)(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p\\b|\\b(?:4k|8k)\\b',re.I)
+    resolution=re.compile(r'(?<!\d)(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\s*p\b|\b(?:4k|8k)\b',re.I)
     candidates=[]
     locator=page.locator('a, button, [role="button"], input[type="radio"], label')
     try: count=min(await locator.count(),500)
@@ -69,9 +69,9 @@ async def click_largest_video_option(page):
                 await el.get_attribute("value"),
                 await el.get_attribute("aria-label"),
                 await el.get_attribute("title")
-            ])).strip().replace("\\n"," ")
+            ])).strip().replace("\n"," ")
             if not resolution.search(text): continue
-            if len(text)>100 or "?" in text or re.search(r'\\b(why|faq|longer|take longer|audio|mp3|only audio|learn more|support)\\b',text,re.I): continue
+            if len(text)>100 or "?" in text or re.search(r'\b(why|faq|longer|take longer|audio|mp3|only audio|learn more|support)\b',text,re.I): continue
             # Text-based exclusion above prevents FAQ headings from being treated as formats.
             candidates.append((el,text[:100],tag))
         except Exception: continue
@@ -91,12 +91,420 @@ async def click_largest_video_option(page):
     targets=active_pages+[page]
     # Some format options only select a quality; a separate Download button starts the transfer.
     download_patterns=[
-        re.compile(r'^download(?: video)?(?: mp4)?$',re.I),
-        re.compile(r'^download now$',re.I),
-        re.compile(r'^prepare download$',re.I),
-        re.compile(r'^get video$',re.I),
-        re.compile(r'^save video$',re.I),
-        re.compile(r'^download file$',re.I),
+        re.compile(r'^download(?: video)?(?: mp4)?
+async def download_from_noadsdl(url:str,target:Path):
+    timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
+    async with async_playwright() as p:
+        browser=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        context=await browser.new_context(accept_downloads=True,viewport={"width":1365,"height":900},locale="en-US")
+        page=await context.new_page(); page.set_default_timeout(timeout)
+        try:
+            await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
+            await page.wait_for_timeout(1800)
+            field=await first_visible([
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
+            ])
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
+            await field.fill(url)
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
+            await page.wait_for_load_state("domcontentloaded",timeout=20000)
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
+        finally:
+            await context.close(); await browser.close()
+    if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
+    proc=await asyncio.create_subprocess_exec("ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(target),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+    out,err=await proc.communicate()
+    if proc.returncode or float(out.decode().strip() or 0)<1: raise RuntimeError("O arquivo baixado não parece ser um vídeo válido: "+err.decode(errors="replace")[-300:])
+
+async def send_to_engine(video:Path):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240,connect=30),follow_redirects=True) as client:
+        with video.open("rb") as f:
+            r=await client.post(ENGINE+"/api/jobs/upload",files={"file":("source.mp4",f,"video/mp4")})
+    if r.status_code not in (200,202): raise RuntimeError(f"WenClips recusou o arquivo (HTTP {r.status_code}): {r.text[:700]}")
+    return r.json()
+
+async def run_job(jid:str,url:str):
+    folder=JOB_DIR/jid; folder.mkdir(parents=True,exist_ok=True); video=folder/"source.mp4"
+    async with worker:
+        try:
+            await update(jid,status="downloading",progress=10,message="Abrindo NoAdsDL e preparando o download…")
+            await download_from_noadsdl(url,video)
+            await update(jid,status="uploading",progress=65,message=f"Vídeo baixado ({round(video.stat().st_size/1048576,1)} MB). Enviando ao WenClips…")
+            result=await send_to_engine(video)
+            await update(jid,status="submitted",progress=100,message="Vídeo enviado ao WenClips. O processamento começou.",wenclips_job=result,original_deleted=True)
+        except Exception as e:
+            await update(jid,status="failed",progress=100,message="A automação não foi concluída.",error=str(e)[-1500:])
+        finally: shutil.rmtree(folder,ignore_errors=True)
+
+@app.get("/",include_in_schema=False)
+def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
+@app.get("/health")
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
+@app.post("/api/jobs",status_code=202)
+async def create_job(payload:Start):
+    url=valid_url(payload.url); jid=uuid.uuid4().hex
+    async with lock: jobs[jid]={"id":jid,"status":"queued","progress":0,"message":"Tarefa adicionada à fila."}
+    asyncio.create_task(run_job(jid,url))
+    return {"id":jid,"status":"queued","status_url":f"/api/jobs/{jid}"}
+@app.get("/api/jobs/{jid}")
+async def get_job(jid:str):
+    async with lock:
+        job=jobs.get(jid)
+        if not job: raise HTTPException(404,"Tarefa não encontrada. O serviço pode ter reiniciado.")
+        return dict(job)
+,re.I),
+        re.compile(r'^download now
+async def download_from_noadsdl(url:str,target:Path):
+    timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
+    async with async_playwright() as p:
+        browser=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        context=await browser.new_context(accept_downloads=True,viewport={"width":1365,"height":900},locale="en-US")
+        page=await context.new_page(); page.set_default_timeout(timeout)
+        try:
+            await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
+            await page.wait_for_timeout(1800)
+            field=await first_visible([
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
+            ])
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
+            await field.fill(url)
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
+            await page.wait_for_load_state("domcontentloaded",timeout=20000)
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
+        finally:
+            await context.close(); await browser.close()
+    if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
+    proc=await asyncio.create_subprocess_exec("ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(target),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+    out,err=await proc.communicate()
+    if proc.returncode or float(out.decode().strip() or 0)<1: raise RuntimeError("O arquivo baixado não parece ser um vídeo válido: "+err.decode(errors="replace")[-300:])
+
+async def send_to_engine(video:Path):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240,connect=30),follow_redirects=True) as client:
+        with video.open("rb") as f:
+            r=await client.post(ENGINE+"/api/jobs/upload",files={"file":("source.mp4",f,"video/mp4")})
+    if r.status_code not in (200,202): raise RuntimeError(f"WenClips recusou o arquivo (HTTP {r.status_code}): {r.text[:700]}")
+    return r.json()
+
+async def run_job(jid:str,url:str):
+    folder=JOB_DIR/jid; folder.mkdir(parents=True,exist_ok=True); video=folder/"source.mp4"
+    async with worker:
+        try:
+            await update(jid,status="downloading",progress=10,message="Abrindo NoAdsDL e preparando o download…")
+            await download_from_noadsdl(url,video)
+            await update(jid,status="uploading",progress=65,message=f"Vídeo baixado ({round(video.stat().st_size/1048576,1)} MB). Enviando ao WenClips…")
+            result=await send_to_engine(video)
+            await update(jid,status="submitted",progress=100,message="Vídeo enviado ao WenClips. O processamento começou.",wenclips_job=result,original_deleted=True)
+        except Exception as e:
+            await update(jid,status="failed",progress=100,message="A automação não foi concluída.",error=str(e)[-1500:])
+        finally: shutil.rmtree(folder,ignore_errors=True)
+
+@app.get("/",include_in_schema=False)
+def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
+@app.get("/health")
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
+@app.post("/api/jobs",status_code=202)
+async def create_job(payload:Start):
+    url=valid_url(payload.url); jid=uuid.uuid4().hex
+    async with lock: jobs[jid]={"id":jid,"status":"queued","progress":0,"message":"Tarefa adicionada à fila."}
+    asyncio.create_task(run_job(jid,url))
+    return {"id":jid,"status":"queued","status_url":f"/api/jobs/{jid}"}
+@app.get("/api/jobs/{jid}")
+async def get_job(jid:str):
+    async with lock:
+        job=jobs.get(jid)
+        if not job: raise HTTPException(404,"Tarefa não encontrada. O serviço pode ter reiniciado.")
+        return dict(job)
+,re.I),
+        re.compile(r'^prepare download
+async def download_from_noadsdl(url:str,target:Path):
+    timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
+    async with async_playwright() as p:
+        browser=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        context=await browser.new_context(accept_downloads=True,viewport={"width":1365,"height":900},locale="en-US")
+        page=await context.new_page(); page.set_default_timeout(timeout)
+        try:
+            await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
+            await page.wait_for_timeout(1800)
+            field=await first_visible([
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
+            ])
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
+            await field.fill(url)
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
+            await page.wait_for_load_state("domcontentloaded",timeout=20000)
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
+        finally:
+            await context.close(); await browser.close()
+    if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
+    proc=await asyncio.create_subprocess_exec("ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(target),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+    out,err=await proc.communicate()
+    if proc.returncode or float(out.decode().strip() or 0)<1: raise RuntimeError("O arquivo baixado não parece ser um vídeo válido: "+err.decode(errors="replace")[-300:])
+
+async def send_to_engine(video:Path):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240,connect=30),follow_redirects=True) as client:
+        with video.open("rb") as f:
+            r=await client.post(ENGINE+"/api/jobs/upload",files={"file":("source.mp4",f,"video/mp4")})
+    if r.status_code not in (200,202): raise RuntimeError(f"WenClips recusou o arquivo (HTTP {r.status_code}): {r.text[:700]}")
+    return r.json()
+
+async def run_job(jid:str,url:str):
+    folder=JOB_DIR/jid; folder.mkdir(parents=True,exist_ok=True); video=folder/"source.mp4"
+    async with worker:
+        try:
+            await update(jid,status="downloading",progress=10,message="Abrindo NoAdsDL e preparando o download…")
+            await download_from_noadsdl(url,video)
+            await update(jid,status="uploading",progress=65,message=f"Vídeo baixado ({round(video.stat().st_size/1048576,1)} MB). Enviando ao WenClips…")
+            result=await send_to_engine(video)
+            await update(jid,status="submitted",progress=100,message="Vídeo enviado ao WenClips. O processamento começou.",wenclips_job=result,original_deleted=True)
+        except Exception as e:
+            await update(jid,status="failed",progress=100,message="A automação não foi concluída.",error=str(e)[-1500:])
+        finally: shutil.rmtree(folder,ignore_errors=True)
+
+@app.get("/",include_in_schema=False)
+def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
+@app.get("/health")
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
+@app.post("/api/jobs",status_code=202)
+async def create_job(payload:Start):
+    url=valid_url(payload.url); jid=uuid.uuid4().hex
+    async with lock: jobs[jid]={"id":jid,"status":"queued","progress":0,"message":"Tarefa adicionada à fila."}
+    asyncio.create_task(run_job(jid,url))
+    return {"id":jid,"status":"queued","status_url":f"/api/jobs/{jid}"}
+@app.get("/api/jobs/{jid}")
+async def get_job(jid:str):
+    async with lock:
+        job=jobs.get(jid)
+        if not job: raise HTTPException(404,"Tarefa não encontrada. O serviço pode ter reiniciado.")
+        return dict(job)
+,re.I),
+        re.compile(r'^get video
+async def download_from_noadsdl(url:str,target:Path):
+    timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
+    async with async_playwright() as p:
+        browser=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        context=await browser.new_context(accept_downloads=True,viewport={"width":1365,"height":900},locale="en-US")
+        page=await context.new_page(); page.set_default_timeout(timeout)
+        try:
+            await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
+            await page.wait_for_timeout(1800)
+            field=await first_visible([
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
+            ])
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
+            await field.fill(url)
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
+            await page.wait_for_load_state("domcontentloaded",timeout=20000)
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
+        finally:
+            await context.close(); await browser.close()
+    if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
+    proc=await asyncio.create_subprocess_exec("ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(target),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+    out,err=await proc.communicate()
+    if proc.returncode or float(out.decode().strip() or 0)<1: raise RuntimeError("O arquivo baixado não parece ser um vídeo válido: "+err.decode(errors="replace")[-300:])
+
+async def send_to_engine(video:Path):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240,connect=30),follow_redirects=True) as client:
+        with video.open("rb") as f:
+            r=await client.post(ENGINE+"/api/jobs/upload",files={"file":("source.mp4",f,"video/mp4")})
+    if r.status_code not in (200,202): raise RuntimeError(f"WenClips recusou o arquivo (HTTP {r.status_code}): {r.text[:700]}")
+    return r.json()
+
+async def run_job(jid:str,url:str):
+    folder=JOB_DIR/jid; folder.mkdir(parents=True,exist_ok=True); video=folder/"source.mp4"
+    async with worker:
+        try:
+            await update(jid,status="downloading",progress=10,message="Abrindo NoAdsDL e preparando o download…")
+            await download_from_noadsdl(url,video)
+            await update(jid,status="uploading",progress=65,message=f"Vídeo baixado ({round(video.stat().st_size/1048576,1)} MB). Enviando ao WenClips…")
+            result=await send_to_engine(video)
+            await update(jid,status="submitted",progress=100,message="Vídeo enviado ao WenClips. O processamento começou.",wenclips_job=result,original_deleted=True)
+        except Exception as e:
+            await update(jid,status="failed",progress=100,message="A automação não foi concluída.",error=str(e)[-1500:])
+        finally: shutil.rmtree(folder,ignore_errors=True)
+
+@app.get("/",include_in_schema=False)
+def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
+@app.get("/health")
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
+@app.post("/api/jobs",status_code=202)
+async def create_job(payload:Start):
+    url=valid_url(payload.url); jid=uuid.uuid4().hex
+    async with lock: jobs[jid]={"id":jid,"status":"queued","progress":0,"message":"Tarefa adicionada à fila."}
+    asyncio.create_task(run_job(jid,url))
+    return {"id":jid,"status":"queued","status_url":f"/api/jobs/{jid}"}
+@app.get("/api/jobs/{jid}")
+async def get_job(jid:str):
+    async with lock:
+        job=jobs.get(jid)
+        if not job: raise HTTPException(404,"Tarefa não encontrada. O serviço pode ter reiniciado.")
+        return dict(job)
+,re.I),
+        re.compile(r'^save video
+async def download_from_noadsdl(url:str,target:Path):
+    timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
+    async with async_playwright() as p:
+        browser=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        context=await browser.new_context(accept_downloads=True,viewport={"width":1365,"height":900},locale="en-US")
+        page=await context.new_page(); page.set_default_timeout(timeout)
+        try:
+            await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
+            await page.wait_for_timeout(1800)
+            field=await first_visible([
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
+            ])
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
+            await field.fill(url)
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
+            await page.wait_for_load_state("domcontentloaded",timeout=20000)
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
+        finally:
+            await context.close(); await browser.close()
+    if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
+    proc=await asyncio.create_subprocess_exec("ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(target),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+    out,err=await proc.communicate()
+    if proc.returncode or float(out.decode().strip() or 0)<1: raise RuntimeError("O arquivo baixado não parece ser um vídeo válido: "+err.decode(errors="replace")[-300:])
+
+async def send_to_engine(video:Path):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240,connect=30),follow_redirects=True) as client:
+        with video.open("rb") as f:
+            r=await client.post(ENGINE+"/api/jobs/upload",files={"file":("source.mp4",f,"video/mp4")})
+    if r.status_code not in (200,202): raise RuntimeError(f"WenClips recusou o arquivo (HTTP {r.status_code}): {r.text[:700]}")
+    return r.json()
+
+async def run_job(jid:str,url:str):
+    folder=JOB_DIR/jid; folder.mkdir(parents=True,exist_ok=True); video=folder/"source.mp4"
+    async with worker:
+        try:
+            await update(jid,status="downloading",progress=10,message="Abrindo NoAdsDL e preparando o download…")
+            await download_from_noadsdl(url,video)
+            await update(jid,status="uploading",progress=65,message=f"Vídeo baixado ({round(video.stat().st_size/1048576,1)} MB). Enviando ao WenClips…")
+            result=await send_to_engine(video)
+            await update(jid,status="submitted",progress=100,message="Vídeo enviado ao WenClips. O processamento começou.",wenclips_job=result,original_deleted=True)
+        except Exception as e:
+            await update(jid,status="failed",progress=100,message="A automação não foi concluída.",error=str(e)[-1500:])
+        finally: shutil.rmtree(folder,ignore_errors=True)
+
+@app.get("/",include_in_schema=False)
+def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
+@app.get("/health")
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
+@app.post("/api/jobs",status_code=202)
+async def create_job(payload:Start):
+    url=valid_url(payload.url); jid=uuid.uuid4().hex
+    async with lock: jobs[jid]={"id":jid,"status":"queued","progress":0,"message":"Tarefa adicionada à fila."}
+    asyncio.create_task(run_job(jid,url))
+    return {"id":jid,"status":"queued","status_url":f"/api/jobs/{jid}"}
+@app.get("/api/jobs/{jid}")
+async def get_job(jid:str):
+    async with lock:
+        job=jobs.get(jid)
+        if not job: raise HTTPException(404,"Tarefa não encontrada. O serviço pode ter reiniciado.")
+        return dict(job)
+,re.I),
+        re.compile(r'^download file
+async def download_from_noadsdl(url:str,target:Path):
+    timeout=int(os.getenv("BROWSER_TIMEOUT_MS","120000"))
+    async with async_playwright() as p:
+        browser=await p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        context=await browser.new_context(accept_downloads=True,viewport={"width":1365,"height":900},locale="en-US")
+        page=await context.new_page(); page.set_default_timeout(timeout)
+        try:
+            await page.goto("https://noadsdl.com/",wait_until="domcontentloaded",timeout=timeout)
+            await page.wait_for_timeout(1800)
+            field=await first_visible([
+                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
+                page.locator('textarea:not([disabled])'),
+                page.locator('[contenteditable="true"]'),
+                page.locator('[role="textbox"]:not([aria-readonly="true"])')
+            ])
+            if not field:
+                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL. A página pode ter mudado.")
+            editable=await field.evaluate("(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'")
+            if not editable: raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
+            await field.fill(url)
+            await click_named(page,[re.compile("continue to available formats",re.I),re.compile("available formats|show formats|formatos disponíveis",re.I)])
+            await page.wait_for_load_state("domcontentloaded",timeout=20000)
+            dl,description=await click_largest_video_option(page)
+            await dl.save_as(str(target))
+        finally:
+            await context.close(); await browser.close()
+    if not target.is_file() or target.stat().st_size<100000: raise RuntimeError("O NoAdsDL não produziu um arquivo de vídeo válido.")
+    proc=await asyncio.create_subprocess_exec("ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(target),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+    out,err=await proc.communicate()
+    if proc.returncode or float(out.decode().strip() or 0)<1: raise RuntimeError("O arquivo baixado não parece ser um vídeo válido: "+err.decode(errors="replace")[-300:])
+
+async def send_to_engine(video:Path):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240,connect=30),follow_redirects=True) as client:
+        with video.open("rb") as f:
+            r=await client.post(ENGINE+"/api/jobs/upload",files={"file":("source.mp4",f,"video/mp4")})
+    if r.status_code not in (200,202): raise RuntimeError(f"WenClips recusou o arquivo (HTTP {r.status_code}): {r.text[:700]}")
+    return r.json()
+
+async def run_job(jid:str,url:str):
+    folder=JOB_DIR/jid; folder.mkdir(parents=True,exist_ok=True); video=folder/"source.mp4"
+    async with worker:
+        try:
+            await update(jid,status="downloading",progress=10,message="Abrindo NoAdsDL e preparando o download…")
+            await download_from_noadsdl(url,video)
+            await update(jid,status="uploading",progress=65,message=f"Vídeo baixado ({round(video.stat().st_size/1048576,1)} MB). Enviando ao WenClips…")
+            result=await send_to_engine(video)
+            await update(jid,status="submitted",progress=100,message="Vídeo enviado ao WenClips. O processamento começou.",wenclips_job=result,original_deleted=True)
+        except Exception as e:
+            await update(jid,status="failed",progress=100,message="A automação não foi concluída.",error=str(e)[-1500:])
+        finally: shutil.rmtree(folder,ignore_errors=True)
+
+@app.get("/",include_in_schema=False)
+def home(): return FileResponse(Path(__file__).parent/"static"/"index.html",media_type="text/html")
+@app.get("/health")
+def health(): return {"ok":True,"service":APP,"version":"0.2.2","wenclips_engine":ENGINE}
+@app.post("/api/jobs",status_code=202)
+async def create_job(payload:Start):
+    url=valid_url(payload.url); jid=uuid.uuid4().hex
+    async with lock: jobs[jid]={"id":jid,"status":"queued","progress":0,"message":"Tarefa adicionada à fila."}
+    asyncio.create_task(run_job(jid,url))
+    return {"id":jid,"status":"queued","status_url":f"/api/jobs/{jid}"}
+@app.get("/api/jobs/{jid}")
+async def get_job(jid:str):
+    async with lock:
+        job=jobs.get(jid)
+        if not job: raise HTTPException(404,"Tarefa não encontrada. O serviço pode ter reiniciado.")
+        return dict(job)
+,re.I),
     ]
     last_error=None
     for target in targets:

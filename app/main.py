@@ -192,6 +192,11 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
         )
         page = await context.new_page()
         page.set_default_timeout(timeout)
+        browser_diagnostics: list[str] = []
+        page.on("console", lambda msg: browser_diagnostics.append(f"console[{msg.type}]: {msg.text[:180]}") if msg.type == "error" else None)
+        page.on("pageerror", lambda exc: browser_diagnostics.append(f"pageerror: {str(exc)[:180]}"))
+        page.on("requestfailed", lambda req: browser_diagnostics.append(f"requestfailed: {req.method} {req.url[:180]} :: {(req.failure or '')[:100]}"))
+        page.on("response", lambda res: browser_diagnostics.append(f"HTTP {res.status}: {res.url[:180]}") if res.status >= 400 else None)
         try:
             await page.goto("https://noadsdl.com/", wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1800)
@@ -240,9 +245,10 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                     break
                 await page.wait_for_timeout(1000)
             else:
+                diagnostic_tail = " | Diagnóstico do navegador: " + repr(browser_diagnostics[-12:])
                 raise RuntimeError(
                     "O NoAdsDL não terminou de extrair os formatos em 75 segundos. "
-                    "Último texto visível: " + repr(last_body[:900])
+                    "Último texto visível: " + repr(last_body[:900]) + diagnostic_tail
                 )
             download, _description = await click_largest_video_option(page)
             await download.save_as(str(target))

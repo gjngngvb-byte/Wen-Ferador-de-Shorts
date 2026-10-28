@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.4")
+app = FastAPI(title=APP, version="0.2.5")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -193,10 +193,23 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
         page = await context.new_page()
         page.set_default_timeout(timeout)
         browser_diagnostics: list[str] = []
-        page.on("console", lambda msg: browser_diagnostics.append(f"console[{msg.type}]: {msg.text[:180]}") if msg.type == "error" else None)
-        page.on("pageerror", lambda exc: browser_diagnostics.append(f"pageerror: {str(exc)[:180]}"))
-        page.on("requestfailed", lambda req: browser_diagnostics.append(f"requestfailed: {req.method} {req.url[:180]} :: {(req.failure or '')[:100]}"))
-        page.on("response", lambda res: browser_diagnostics.append(f"HTTP {res.status}: {res.url[:180]}") if res.status >= 400 else None)
+        def record_diagnostic(message: str) -> None:
+            browser_diagnostics.append(message[:360])
+            del browser_diagnostics[:-30]
+        def record_failed_request(req) -> None:
+            request_url = req.url.lower()
+            # Analytics/telemetry cancellations are common and obscure the real extraction failure.
+            if any(host in request_url for host in ("google-analytics.com", "/api/analytics/", "/api/future-updates/", "/cdn-cgi/rum")):
+                return
+            record_diagnostic(f"requestfailed: {req.method} {req.url[:220]} :: {(req.failure or '')[:100]}")
+        def record_bad_response(res) -> None:
+            if res.status >= 400:
+                record_diagnostic(f"HTTP {res.status}: {res.request.method} {res.url[:240]}")
+        page.on("console", lambda msg: record_diagnostic(f"console[{msg.type}]: {msg.text[:240]}") if msg.type == "error" else None)
+        page.on("pageerror", lambda exc: record_diagnostic(f"pageerror: {str(exc)[:240]}"))
+        page.on("requestfailed", record_failed_request)
+        page.on("response", record_bad_response)
+        page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if "noadsdl.com/api/" in req.url.lower() and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/")) else None)
         try:
             await page.goto("https://noadsdl.com/", wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1800)
@@ -316,7 +329,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.4", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.2.5", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

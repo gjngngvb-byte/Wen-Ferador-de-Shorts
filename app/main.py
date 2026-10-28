@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.3")
+app = FastAPI(title=APP, version="0.2.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -210,13 +210,40 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                 raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
             await field.fill(url)
             await click_named(page, [
-                re.compile("continue to available formats", re.I),
-                re.compile("available formats|show formats|formatos disponíveis", re.I),
+                re.compile(r"extract formats", re.I),
+                re.compile(r"continue to available formats", re.I),
+                re.compile(r"available formats|show formats|formatos disponíveis", re.I),
             ])
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=20000)
             except PlaywrightTimeoutError:
                 pass
+
+            # NoAdsDL may show "Reading video info…" while it resolves the source.
+            deadline = asyncio.get_running_loop().time() + 75
+            last_body = ""
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    last_body = (await page.locator("body").inner_text())[:2500]
+                except Exception:
+                    last_body = ""
+                reading = re.search(r"reading video info|extracting formats|please wait", last_body, re.I)
+                found_format = await page.locator(
+                    'a, button, [role="button"], input[type="radio"], label'
+                ).evaluate_all("""els => els.some(e => {
+                    const t = [e.innerText, e.value, e.getAttribute('aria-label'), e.title].filter(Boolean).join(' ');
+                    return /(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p|\\b(?:4k|8k)\\b/i.test(t)
+                      && t.length < 90 && !/[?]/.test(t)
+                      && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
+                })""")
+                if found_format and not reading:
+                    break
+                await page.wait_for_timeout(1000)
+            else:
+                raise RuntimeError(
+                    "O NoAdsDL não terminou de extrair os formatos em 75 segundos. "
+                    "Último texto visível: " + repr(last_body[:900])
+                )
             download, _description = await click_largest_video_option(page)
             await download.save_as(str(target))
         finally:
@@ -283,7 +310,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.3", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.2.4", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

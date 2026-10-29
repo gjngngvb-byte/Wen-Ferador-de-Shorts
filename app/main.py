@@ -225,7 +225,8 @@ async def click_largest_video_option(page, trace=None):
 
 
 async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
-    async def trace(message: str) -> None:\n        await add_trace(jid, message)\n    timeout = int(os.getenv("BROWSER_TIMEOUT_MS", "120000"))
+    async def trace(message: str) -> None:
+        await add_trace(jid, message)\n    timeout = int(os.getenv("BROWSER_TIMEOUT_MS", "120000"))
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,

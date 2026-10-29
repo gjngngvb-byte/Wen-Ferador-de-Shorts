@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.3.0")
+app = FastAPI(title=APP, version="0.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,6 +102,20 @@ async def click_named(page, patterns, trace=None) -> None:
                         click_method = "evento DOM element.click()"
                 if trace:
                     await trace(f"CLIQUE EXECUTADO via {click_method}; botão «{label or str(pattern)[:100]}».")
+                # Dispara também o evento DOM e registra a estrutura real do botão.
+                try:
+                    details = await item.evaluate("""e => {
+                        e.click();
+                        return {html:e.outerHTML.slice(0,1200), disabled:e.disabled,
+                            ariaDisabled:e.getAttribute('aria-disabled'),
+                            parent:e.parentElement ? e.parentElement.outerHTML.slice(0,1600) : null};
+                    }""")
+                    if trace:
+                        await trace("DIAGNÓSTICO DO BOTÃO APÓS EVENTO DOM: " + repr(details))
+                        await trace("EVENTO DOM click() disparado também.")
+                except Exception as dom_exc:
+                    if trace:
+                        await trace(f"EVENTO DOM click() falhou: {type(dom_exc).__name__}: {str(dom_exc)[:160]}")
                 await page.wait_for_timeout(2500)
                 body_after = (await page.locator("body").inner_text())[:900]
                 if trace:
@@ -461,7 +475,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.3.0", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.3.1", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

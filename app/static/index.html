@@ -47,7 +47,7 @@ form.addEventListener("submit",async e=>{
     for(let i=0;i<360;i++){
       await wait(3000);
       const s=await fetch(d.status_url);const j=await s.json();
-      showMessage((j.message||j.status)+"\nStatus: "+j.status+"\nProgresso: "+(j.progress||0)+"%"+(j.error?"\n\n"+j.error:""));
+      showMessage((j.message||j.status)+"\nStatus: "+j.status+"\nProgresso: "+(j.progress||0)+"%"+((j.trace&&j.trace.length)?"\n\nREGISTRO PASSO A PASSO:\n"+j.trace.map((x,n)=>String(n+1)+". "+x).join("\n"):"")+(j.error?"\n\nERRO FINAL:\n"+j.error:""));
       if(["submitted","failed"].includes(j.status))break;
     }
   } catch(err) { showMessage("Erro: "+err.message); }

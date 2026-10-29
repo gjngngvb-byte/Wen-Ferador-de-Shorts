@@ -104,15 +104,14 @@ async def click_named(page, patterns, trace=None) -> None:
                     await trace(f"CLIQUE EXECUTADO via {click_method}; botão «{label or str(pattern)[:100]}».")
                 # Dispara também o evento DOM e registra a estrutura real do botão.
                 try:
-                    details = await item.evaluate("""e => {
-                        e.click();
-                        return {html:e.outerHTML.slice(0,1200), disabled:e.disabled,
-                            ariaDisabled:e.getAttribute('aria-disabled'),
-                            parent:e.parentElement ? e.parentElement.outerHTML.slice(0,1600) : null};
-                    }""")
+                    details = await item.evaluate("""e => ({
+                        html:e.outerHTML.slice(0,1200), disabled:e.disabled,
+                        ariaDisabled:e.getAttribute('aria-disabled'),
+                        parent:e.parentElement ? e.parentElement.outerHTML.slice(0,1600) : null
+                    })""")
                     if trace:
-                        await trace("DIAGNÓSTICO DO BOTÃO APÓS EVENTO DOM: " + repr(details))
-                        await trace("EVENTO DOM click() disparado também.")
+                        await trace("ESTRUTURA DO BOTÃO APÓS UM ÚNICO CLIQUE: " + repr(details))
+                        await trace("Não foi disparado clique DOM adicional para evitar reiniciar/cancelar a extração.")
                 except Exception as dom_exc:
                     if trace:
                         await trace(f"EVENTO DOM click() falhou: {type(dom_exc).__name__}: {str(dom_exc)[:160]}")
@@ -191,7 +190,8 @@ async def click_largest_video_option(page, trace=None):
 
     # Algumas opções já iniciam o download; outras apenas selecionam a resolução.
     try:
-        async with page.expect_download(timeout=8000) as download_info:
+        # O NoAdsDL pode levar vários segundos processando a opção antes de iniciar o download.
+        async with page.expect_download(timeout=45000) as download_info:
             await option.click(timeout=15000)
         download = await download_info.value
         if trace:
@@ -199,7 +199,7 @@ async def click_largest_video_option(page, trace=None):
         return download, description
     except PlaywrightTimeoutError:
         if trace:
-            await trace(f"APÓS CLIQUE em «{description}»: nenhum download direto em 8 s; vou procurar botão Download ou janela aberta.")
+            await trace(f"APÓS CLIQUE em «{description}»: nenhum evento de download em 45 s; vou procurar botão Download ou janela aberta.")
 
     await page.wait_for_timeout(1500)
     targets = [p for p in popup_pages if not p.is_closed()] + [page]

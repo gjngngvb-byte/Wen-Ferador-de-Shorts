@@ -52,6 +52,14 @@ async def update(jid: str, **values: Any) -> None:
             jobs[jid].update(values)
 
 
+async def add_trace(jid: str, message: str) -> None:
+    async with lock:
+        if jid in jobs:
+            events = jobs[jid].setdefault("trace", [])
+            events.append(message[:700])
+            jobs[jid]["trace"] = events[-100:]
+
+
 async def first_visible(locators):
     for locator in locators:
         try:
@@ -64,20 +72,27 @@ async def first_visible(locators):
     return None
 
 
-async def click_named(page, patterns) -> None:
+async def click_named(page, patterns, trace=None) -> None:
     for pattern in patterns:
         for role in ("button", "link"):
             try:
                 item = page.get_by_role(role, name=pattern).first
                 if await item.count() and await item.is_visible() and await item.is_enabled():
+                    label = (await item.inner_text()).strip().replace("\\n", " ")[:180]
+                    if trace:
+                        await trace(f"CLIQUE: {role} «{label or str(pattern)[:100]}». Executando clique…")
                     await item.click(timeout=15000)
+                    await page.wait_for_timeout(1200)
+                    if trace:
+                        body_after = (await page.locator("body").inner_text())[:500]
+                        await trace(f"APÓS CLIQUE em «{label or str(pattern)[:100]}»: URL={page.url}; texto visível={body_after!r}")
                     return
             except Exception:
                 continue
     raise RuntimeError("Não encontrei o botão 'Continue to available formats' no NoAdsDL. A interface pode ter mudado.")
 
 
-async def click_largest_video_option(page):
+async def click_largest_video_option(page, trace=None):
     await page.wait_for_timeout(3000)
     resolution = re.compile(r"(?<!\d)(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\s*p\b|\b(?:4k|8k)\b", re.I)
     locator = page.locator('a, button, [role="button"], input[type="radio"], label')
@@ -108,6 +123,8 @@ async def click_largest_video_option(page):
         except Exception:
             continue
 
+    if trace:
+        await trace("OPÇÕES DE RESOLUÇÃO ENCONTRADAS: " + (", ".join(repr(x[1]) for x in candidates) if candidates else "nenhuma opção de resolução visível/enabled"))
     if not candidates:
         body = ""
         try:
@@ -131,6 +148,8 @@ async def click_largest_video_option(page):
                 break
     if preferred:
         option, description = preferred
+    if trace:
+        await trace(f"SELEÇÃO: clicarei em «{description}» (prioridade: 1080p MP4 quando disponível).")
     context = page.context
     popup_pages = []
     context.on("page", lambda new_page: popup_pages.append(new_page))
@@ -139,9 +158,13 @@ async def click_largest_video_option(page):
     try:
         async with page.expect_download(timeout=8000) as download_info:
             await option.click(timeout=15000)
-        return await download_info.value, description
+        download = await download_info.value
+        if trace:
+            await trace(f"APÓS CLIQUE em «{description}»: o navegador iniciou download diretamente: {download.suggested_filename}")
+        return download, description
     except PlaywrightTimeoutError:
-        pass
+        if trace:
+            await trace(f"APÓS CLIQUE em «{description}»: nenhum download direto em 8 s; vou procurar botão Download ou janela aberta.")
 
     await page.wait_for_timeout(1500)
     targets = [p for p in popup_pages if not p.is_closed()] + [page]
@@ -162,11 +185,19 @@ async def click_largest_video_option(page):
                     if not await button.count() or not await button.is_visible() or not await button.is_enabled():
                         continue
                     try:
+                        button_label = (await button.inner_text()).strip().replace("\\n", " ")[:120]
+                        if trace:
+                            await trace(f"BOTÃO ENCONTRADO: {role} «{button_label or str(pattern)}» em {target.url}. Vou clicar.")
                         async with target.expect_download(timeout=45000) as download_info:
                             await button.click(timeout=15000)
-                        return await download_info.value, description
+                        download = await download_info.value
+                        if trace:
+                            await trace(f"APÓS CLIQUE em «{button_label or str(pattern)}»: download iniciado: {download.suggested_filename}")
+                        return download, description
                     except PlaywrightTimeoutError as exc:
                         last_error = exc
+                        if trace:
+                            await trace(f"APÓS CLIQUE em botão Download: nenhum evento de download após 45 s ({type(exc).__name__}: {str(exc)[:160]}).")
                         await target.wait_for_timeout(1200)
                 except Exception as exc:
                     last_error = exc
@@ -174,8 +205,13 @@ async def click_largest_video_option(page):
     # Some sites turn the selected format into a direct download only after the page updates.
     try:
         async with page.expect_download(timeout=12000) as download_info:
+            if trace:
+                await trace(f"RETESTE: clicando novamente em «{description}».")
             await option.click(timeout=5000)
-        return await download_info.value, description
+        download = await download_info.value
+        if trace:
+            await trace(f"APÓS SEGUNDO CLIQUE em «{description}»: download iniciado: {download.suggested_filename}")
+        return download, description
     except Exception as exc:
         body = ""
         try:
@@ -188,8 +224,8 @@ async def click_largest_video_option(page):
         ) from (last_error or exc)
 
 
-async def download_from_noadsdl(url: str, target: Path) -> None:
-    timeout = int(os.getenv("BROWSER_TIMEOUT_MS", "120000"))
+async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
+    async def trace(message: str) -> None:\n        await add_trace(jid, message)\n    timeout = int(os.getenv("BROWSER_TIMEOUT_MS", "120000"))
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
@@ -225,8 +261,18 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
             # Isso pula a página inicial e a etapa manual de colar o link.
             encoded_url = quote(url, safe="")
             direct_url = "https://noadsdl.com/youtube-video-downloader-online?url=" + encoded_url
+            await trace(f"ABRINDO NoAdsDL: {direct_url}")
             await page.goto(direct_url, wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1800)
+            await trace(f"PÁGINA ABERTA: URL={page.url}; título={(await page.title())[:160]}")
+            try:
+                controls = await page.locator('button, a, [role="button"], input[type="submit"]').evaluate_all("""els => els.filter(e => {
+                    const s=getComputedStyle(e), r=e.getBoundingClientRect();
+                    return s.visibility!=='hidden' && s.display!=='none' && r.width>0 && r.height>0;
+                }).map(e => ({tag:e.tagName.toLowerCase(),text:(e.innerText||e.value||e.getAttribute('aria-label')||e.title||'').trim().replace(/\\s+/g,' ').slice(0,140),disabled:!!e.disabled})).filter(x=>x.text).slice(0,80)""")
+                await trace("BOTÕES/LINKS VISÍVEIS NA ABERTURA: " + repr(controls))
+            except Exception as exc:
+                await trace(f"Não consegui listar os controles iniciais: {type(exc).__name__}: {str(exc)[:160]}")
 
             # Se a rota não iniciar sozinha, aciona o botão da própria ferramenta.
             initial_body = ""
@@ -245,7 +291,9 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                   && t.length < 90 && !/[?]/.test(t)
                   && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
             })""")
+            await trace("ESTADO INICIAL: " + repr(initial_body[:900]))
             if not initial_formats:
+                await trace("Não há botão de formato visível ainda; procurando botão para extrair/mostrar formatos.")
                 try:
                     await click_named(page, [
                         re.compile(r"show mp4\s*&\s*mp3 formats", re.I),
@@ -254,8 +302,9 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                         re.compile(r"extract formats", re.I),
                         re.compile(r"continue to available formats", re.I),
                         re.compile(r"available formats|formatos disponíveis", re.I),
-                    ])
-                except RuntimeError:
+                    ], trace=trace)
+                except RuntimeError as click_error:
+                    await trace(f"NENHUM BOTÃO DE EXTRAÇÃO CLICADO: {click_error}")
                     # A página pode já ter começado a processar o parâmetro url sem mostrar o botão.
                     pass
             try:
@@ -265,6 +314,7 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
 
             # Aguarda os formatos reais aparecerem. O NoAdsDL pode manter o texto
             # "Reading video info…" mesmo depois de renderizar os botões.
+            await trace("AGUARDANDO até 75 s por opções reais de vídeo MP4.")
             deadline = asyncio.get_running_loop().time() + 75
             last_body = ""
             while asyncio.get_running_loop().time() < deadline:
@@ -286,16 +336,28 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                       && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
                 })""")
                 if found_format:
+                    try:
+                        formats = await page.locator('a, button, [role="button"], input[type="radio"], label').evaluate_all("""els => els.filter(e => {
+                            const t=[e.innerText,e.value,e.getAttribute('aria-label'),e.title].filter(Boolean).join(' ').replace(/\\s+/g,' ').trim();
+                            const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+                            return s.visibility!=='hidden' && s.display!=='none' && r.width>0 && r.height>0 && !e.disabled && /(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p/i.test(t) && /\\bMP4\\b/i.test(t) && t.length<120 && !/[?]/.test(t);
+                        }).map(e=>({tag:e.tagName.toLowerCase(),text:[e.innerText,e.value,e.getAttribute('aria-label'),e.title].filter(Boolean).join(' ').replace(/\\s+/g,' ').trim().slice(0,120)})).slice(0,80)""")
+                        await trace("FORMATOS MP4 ENCONTRADOS: " + repr(formats))
+                    except Exception as exc:
+                        await trace(f"Detectei opção MP4, mas falhou ao listar: {type(exc).__name__}: {str(exc)[:160]}")
                     break
                 await page.wait_for_timeout(1000)
             else:
+                await trace("RESULTADO DA ESPERA: nenhum botão MP4 elegível apareceu em 75 s.")
                 diagnostic_tail = " | Diagnóstico do navegador: " + repr(browser_diagnostics[-12:])
                 raise RuntimeError(
                     "O NoAdsDL não exibiu um botão de vídeo MP4 em 75 segundos. "
                     "Último texto visível: " + repr(last_body[:900]) + diagnostic_tail
                 )
-            download, _description = await click_largest_video_option(page)
+            download, _description = await click_largest_video_option(page, trace=trace)
+            await trace(f"DOWNLOAD RECEBIDO PELO PLAYWRIGHT: nome={download.suggested_filename!r}; salvando arquivo temporário.")
             await download.save_as(str(target))
+            await trace(f"ARQUIVO SALVO: {target.stat().st_size} bytes.")
         finally:
             await context.close()
             await browser.close()
@@ -336,7 +398,7 @@ async def run_job(jid: str, url: str) -> None:
     async with worker:
         try:
             await update(jid, status="downloading", progress=10, message="Abrindo NoAdsDL e preparando o download…")
-            await download_from_noadsdl(url, video)
+            await download_from_noadsdl(url, video, jid)
             await update(
                 jid, status="uploading", progress=65,
                 message=f"Vídeo baixado ({round(video.stat().st_size / 1048576, 1)} MB). Enviando ao WenClips…",

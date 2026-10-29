@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.8")
+app = FastAPI(title=APP, version="0.2.9")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,9 +86,24 @@ async def click_named(page, patterns, trace=None) -> None:
                 attempted.append(label)
                 if trace:
                     await trace(f"CLIQUE ÚNICO: {role} «{label or str(pattern)[:100]}». Executando clique…")
-                await item.click(timeout=15000)
-                await page.wait_for_timeout(1500)
-                body_after = (await page.locator("body").inner_text())[:700]
+                try:
+                    await item.click(timeout=5000)
+                    click_method = "Playwright normal"
+                except Exception as normal_exc:
+                    if trace:
+                        await trace(f"CLIQUE NORMAL FALHOU; tentando clique forçado: {type(normal_exc).__name__}: {str(normal_exc)[:160]}")
+                    try:
+                        await item.click(timeout=5000, force=True)
+                        click_method = "Playwright force=True"
+                    except Exception as force_exc:
+                        if trace:
+                            await trace(f"CLIQUE FORÇADO FALHOU; tentando evento DOM: {type(force_exc).__name__}: {str(force_exc)[:160]}")
+                        await item.evaluate("(e) => e.click()")
+                        click_method = "evento DOM element.click()"
+                if trace:
+                    await trace(f"CLIQUE EXECUTADO via {click_method}; botão «{label or str(pattern)[:100]}».")
+                await page.wait_for_timeout(2500)
+                body_after = (await page.locator("body").inner_text())[:900]
                 if trace:
                     await trace(f"RESULTADO DO CLIQUE: «{label or str(pattern)[:100]}»; URL={page.url}; texto visível={body_after!r}")
                 return
@@ -429,7 +444,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.8", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.2.9", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

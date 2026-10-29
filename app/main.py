@@ -450,6 +450,47 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
                     resources = []
                 await trace("SCRIPTS CARREGADOS: " + repr(script_urls))
                 await trace("RECURSOS RELEVANTES DA PÁGINA: " + repr(resources))
+                # Inspeciona somente scripts públicos já carregados pela página para localizar
+                # a lógica de extração e os endpoints usados pelo botão, sem repetir cliques.
+                try:
+                    script_inspection = await page.evaluate("""async () => {
+                      const urls = [...document.scripts].map(s => s.src).filter(Boolean).slice(0, 24);
+                      const out = [];
+                      for (const url of urls) {
+                        try {
+                          const response = await fetch(url, { credentials: 'same-origin' });
+                          if (!response.ok) { out.push({url, status: response.status}); continue; }
+                          const source = await response.text();
+                          const matches = [];
+                          const re = /extract|format|youtube|api\\/status|fetch\\(|XMLHttpRequest|cloudflare|captcha|challenge/ig;
+                          let m, last = -1;
+                          while ((m = re.exec(source)) && matches.length < 8) {
+                            if (m.index - last < 180) continue;
+                            last = m.index;
+                            matches.push(source.slice(Math.max(0, m.index - 100), Math.min(source.length, m.index + 240)).replace(/\\s+/g, ' '));
+                          }
+                          if (matches.length) out.push({url, status: response.status, length: source.length, snippets: matches});
+                        } catch (e) { out.push({url, error: String(e).slice(0, 120)}); }
+                      }
+                      return out;
+                    }""")
+                    await trace("INSPEÇÃO DOS SCRIPTS PÚBLICOS (trechos relacionados à extração): " + repr(script_inspection)[:12000])
+                except Exception as inspect_exc:
+                    await trace(f"INSPEÇÃO DE SCRIPTS FALHOU: {type(inspect_exc).__name__}: {str(inspect_exc)[:200]}")
+                try:
+                    state_inspection = await page.evaluate("""() => ({
+                      title: document.title,
+                      url: location.href,
+                      visibleText: (document.body?.innerText || '').slice(0, 1800),
+                      buttons: [...document.querySelectorAll('button, a, [role=button], input')].filter(e => {
+                        const r=e.getBoundingClientRect(), s=getComputedStyle(e);
+                        return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+                      }).slice(0,80).map(e=>({tag:e.tagName, id:e.id, text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ').slice(0,120), disabled:!!e.disabled, html:e.outerHTML.slice(0,260)})),
+                      forms: [...document.forms].map(f=>({action:f.action, method:f.method, html:f.outerHTML.slice(0,800)}))
+                    })""")
+                    await trace("ESTADO FINAL DO DOM: " + repr(state_inspection)[:7000])
+                except Exception as state_exc:
+                    await trace(f"INSPEÇÃO DO DOM FALHOU: {type(state_exc).__name__}: {str(state_exc)[:200]}")
                 diagnostic_tail = " | Diagnóstico do navegador (últimos 24 eventos): " + repr(browser_diagnostics[-24:])
                 raise RuntimeError(
                     "O NoAdsDL não exibiu um botão de vídeo MP4 em 75 segundos. "

@@ -279,20 +279,35 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
         def record_diagnostic(message: str) -> None:
             browser_diagnostics.append(message[:360])
             del browser_diagnostics[:-30]
+        def ignored_telemetry(request_url: str) -> bool:
+            lowered = request_url.lower()
+            return any(x in lowered for x in (
+                "google-analytics.com", "/api/analytics/", "/api/future-updates/",
+                "/cdn-cgi/rum", "doubleclick.net", "googletagmanager.com"
+            ))
         def record_failed_request(req) -> None:
-            request_url = req.url.lower()
-            # Analytics/telemetry cancellations are common and obscure the real extraction failure.
-            if any(host in request_url for host in ("google-analytics.com", "/api/analytics/", "/api/future-updates/", "/cdn-cgi/rum")):
+            if ignored_telemetry(req.url):
                 return
-            record_diagnostic(f"requestfailed: {req.method} {req.url[:220]} :: {(req.failure or '')[:100]}")
+            if req.resource_type in ("document", "script", "xhr", "fetch") or req.method.upper() not in ("GET", "HEAD"):
+                record_diagnostic(
+                    f"requestfailed[{req.resource_type}]: {req.method} {req.url[:220]} :: {(req.failure or '')[:100]}"
+                )
         def record_bad_response(res) -> None:
-            if res.status >= 400 or ("noadsdl.com/api/" in res.url.lower() and not any(x in res.url.lower() for x in ("/api/analytics/", "/api/future-updates/"))):
-                record_diagnostic(f"HTTP {res.status}: {res.request.method} {res.url[:240]}")
-        page.on("console", lambda msg: record_diagnostic(f"console[{msg.type}]: {msg.text[:240]}") if msg.type == "error" else None)
+            req = res.request
+            if ignored_telemetry(res.url):
+                return
+            if res.status >= 400 or req.resource_type in ("xhr", "fetch") or req.method.upper() not in ("GET", "HEAD"):
+                record_diagnostic(
+                    f"HTTP {res.status}[{req.resource_type}]: {req.method} {res.url[:240]}"
+                )
+        page.on("console", lambda msg: record_diagnostic(f"console[{msg.type}]: {msg.text[:240]}") if msg.type in ("error", "warning") else None)
         page.on("pageerror", lambda exc: record_diagnostic(f"pageerror: {str(exc)[:240]}"))
         page.on("requestfailed", record_failed_request)
         page.on("response", record_bad_response)
-        page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if ("noadsdl.com/api/" in req.url.lower() or req.method.upper() not in ("GET", "HEAD")) and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/", "google-analytics.com", "/cdn-cgi/rum")) else None)
+        page.on("request", lambda req: record_diagnostic(
+            f"request[{req.resource_type}]: {req.method} {req.url[:240]}"
+        ) if (req.resource_type in ("document", "script", "xhr", "fetch") or req.method.upper() not in ("GET", "HEAD"))
+          and not ignored_telemetry(req.url) else None)
         try:
             # Abre a página limpa. Passar ?url= faz o próprio site iniciar uma
             # leitura automática e deixar "Reading video info…" ativo antes do clique,
@@ -420,10 +435,28 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
                 await page.wait_for_timeout(1000)
             else:
                 await trace("RESULTADO DA ESPERA: nenhum botão MP4 elegível apareceu em 75 s.")
-                diagnostic_tail = " | Diagnóstico do navegador: " + repr(browser_diagnostics[-12:])
+                try:
+                    script_urls = await page.locator("script[src]").evaluate_all(
+                        "els => els.map(e => e.src).filter(Boolean).slice(0,30)"
+                    )
+                except Exception:
+                    script_urls = []
+                try:
+                    resources = await page.evaluate("""() => performance.getEntriesByType('resource')
+                        .map(e => ({name:e.name, type:e.initiatorType, duration:Math.round(e.duration)}))
+                        .filter(e => /noadsdl|api|extract|format|youtube|googlevideo|cloudflare/i.test(e.name))
+                        .slice(-35)""")
+                except Exception:
+                    resources = []
+                await trace("SCRIPTS CARREGADOS: " + repr(script_urls))
+                await trace("RECURSOS RELEVANTES DA PÁGINA: " + repr(resources))
+                diagnostic_tail = " | Diagnóstico do navegador (últimos 24 eventos): " + repr(browser_diagnostics[-24:])
                 raise RuntimeError(
                     "O NoAdsDL não exibiu um botão de vídeo MP4 em 75 segundos. "
-                    "Último texto visível: " + repr(last_body[:900]) + diagnostic_tail
+                    "Último texto visível: " + repr(last_body[:900])
+                    + " | Scripts: " + repr(script_urls[:12])
+                    + " | Recursos: " + repr(resources[-18:])
+                    + diagnostic_tail
                 )
             download, _description = await click_largest_video_option(page, trace=trace)
             await trace(f"DOWNLOAD RECEBIDO PELO PLAYWRIGHT: nome={download.suggested_filename!r}; salvando arquivo temporário.")

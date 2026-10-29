@@ -119,13 +119,18 @@ async def click_largest_video_option(page):
             "Texto visível na página: " + repr(body)
         )
 
-    # Prioriza a opção exata 1080p MP4; se não existir, usa a última opção de vídeo disponível.
+    # Prioriza 1080p MP4 mesmo quando o botão inclui tamanho, ícone ou texto extra.
     option, description = candidates[-1]
+    preferred = None
     for candidate in candidates:
         normalized = re.sub(r"\s+", " ", candidate[1]).strip()
-        if re.fullmatch(r"1080p\s*MP4", normalized, re.I):
-            option, description = candidate
-            break
+        if re.search(r"(?<!\d)1080p\b", normalized, re.I) and re.search(r"\bMP4\b", normalized, re.I):
+            preferred = candidate
+            # Se o texto for exatamente "1080p MP4", é a melhor correspondência.
+            if re.fullmatch(r"1080p\s*MP4", normalized, re.I):
+                break
+    if preferred:
+        option, description = preferred
     context = page.context
     popup_pages = []
     context.on("page", lambda new_page: popup_pages.append(new_page))

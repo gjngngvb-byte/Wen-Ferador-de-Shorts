@@ -7,7 +7,7 @@ import shutil
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.7")
+app = FastAPI(title=APP, version="0.2.8")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -216,30 +216,42 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
         page.on("response", record_bad_response)
         page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if "noadsdl.com/api/" in req.url.lower() and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/")) else None)
         try:
-            # Abre diretamente a ferramenta de vídeo, evitando a etapa intermediária da página inicial.
-            await page.goto("https://noadsdl.com/save-youtube-video-online", wait_until="domcontentloaded", timeout=timeout)
+            # Vai direto à rota de download e passa o link do YouTube no parâmetro url.
+            # Isso pula a página inicial e a etapa manual de colar o link.
+            encoded_url = quote(url, safe="")
+            direct_url = "https://noadsdl.com/youtube-video-downloader-online?url=" + encoded_url
+            await page.goto(direct_url, wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1800)
-            field = await first_visible([
-                page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([disabled])'),
-                page.locator('textarea:not([disabled])'),
-                page.locator('[contenteditable="true"]'),
-                page.locator('[role="textbox"]:not([aria-readonly="true"])'),
-            ])
-            if not field:
-                raise RuntimeError("Não encontrei um campo editável para o link no NoAdsDL.")
-            editable = await field.evaluate(
-                "(el) => el.isContentEditable || ['input','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'textbox'"
-            )
-            if not editable:
-                raise RuntimeError("O seletor encontrou um elemento não editável; download cancelado.")
-            await field.fill(url)
-            await click_named(page, [
-                re.compile(r"show mp4\s*&\s*mp3 formats", re.I),
-                re.compile(r"show formats", re.I),
-                re.compile(r"extract formats", re.I),
-                re.compile(r"continue to available formats", re.I),
-                re.compile(r"available formats|formatos disponíveis", re.I),
-            ])
+
+            # Se a rota não iniciar sozinha, aciona o botão da própria ferramenta.
+            initial_body = ""
+            try:
+                initial_body = (await page.locator("body").inner_text())[:2500]
+            except Exception:
+                pass
+            already_processing = bool(re.search(
+                r"reading video info|extracting formats|please wait", initial_body, re.I
+            ))
+            initial_formats = await page.locator(
+                'a, button, [role="button"], input[type="radio"], label'
+            ).evaluate_all("""els => els.some(e => {
+                const t = [e.innerText, e.value, e.getAttribute('aria-label'), e.title].filter(Boolean).join(' ');
+                return /(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p|\\b(?:4k|8k)\\b/i.test(t)
+                  && t.length < 90 && !/[?]/.test(t)
+                  && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
+            })""")
+            if not already_processing and not initial_formats:
+                try:
+                    await click_named(page, [
+                        re.compile(r"show mp4\\s*&\\s*mp3 formats", re.I),
+                        re.compile(r"show formats", re.I),
+                        re.compile(r"extract formats", re.I),
+                        re.compile(r"continue to available formats", re.I),
+                        re.compile(r"available formats|formatos disponíveis", re.I),
+                    ])
+                except RuntimeError:
+                    # A página pode já ter começado a processar o parâmetro url sem mostrar o botão.
+                    pass
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=20000)
             except PlaywrightTimeoutError:
@@ -337,7 +349,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.7", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.2.8", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

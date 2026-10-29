@@ -24,7 +24,7 @@ jobs: dict[str, dict[str, Any]] = {}
 lock = asyncio.Lock()
 worker = asyncio.Lock()
 
-app = FastAPI(title=APP, version="0.2.9")
+app = FastAPI(title=APP, version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -315,6 +315,23 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
                   && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
             })""")
             await trace("ESTADO INICIAL: " + repr(initial_body[:900]))
+            # A rota de destino nem sempre preenche o campo automaticamente pelo parâmetro ?url=.
+            # Preenchemos o campo real antes de clicar, evitando que o site processe um valor vazio.
+            try:
+                url_input = page.locator('input[type="url"], input[placeholder*="youtube" i], input[aria-label*="youtube" i]').first
+                if await url_input.count() and await url_input.is_visible() and await url_input.is_enabled():
+                    current_value = (await url_input.input_value()).strip()
+                    if current_value != url:
+                        await url_input.fill(url, timeout=5000)
+                        await trace(f"CAMPO DE URL PREENCHIDO: antes={current_value[:120]!r}; depois={(await url_input.input_value())[:160]!r}")
+                    else:
+                        await trace("CAMPO DE URL JÁ CONTINHA O LINK CORRETO.")
+                else:
+                    await trace("CAMPO DE URL ESPECÍFICO NÃO ENCONTRADO; verificando inputs visíveis.")
+                    visible_inputs = await page.locator("input").evaluate_all("""els => els.filter(e => {const r=e.getBoundingClientRect(),s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;}).map(e=>({type:e.type,placeholder:e.placeholder,aria:e.getAttribute('aria-label'),value:e.value})).slice(0,15)""")
+                    await trace("INPUTS VISÍVEIS: " + repr(visible_inputs))
+            except Exception as input_exc:
+                await trace(f"FALHA AO PREENCHER LINK: {type(input_exc).__name__}: {str(input_exc)[:180]}")
             if not initial_formats:
                 await trace("Não há botão de formato visível ainda; procurando botão para extrair/mostrar formatos.")
                 try:
@@ -444,7 +461,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP, "version": "0.2.9", "wenclips_engine": ENGINE}
+    return {"ok": True, "service": APP, "version": "0.3.0", "wenclips_engine": ENGINE}
 
 
 @app.post("/api/jobs", status_code=202)

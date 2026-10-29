@@ -294,11 +294,11 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
         page.on("response", record_bad_response)
         page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if ("noadsdl.com/api/" in req.url.lower() or req.method.upper() not in ("GET", "HEAD")) and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/", "google-analytics.com", "/cdn-cgi/rum")) else None)
         try:
-            # Vai direto à rota de download e passa o link do YouTube no parâmetro url.
-            # Isso pula a página inicial e a etapa manual de colar o link.
-            encoded_url = quote(url, safe="")
-            direct_url = "https://noadsdl.com/youtube-video-downloader-online?url=" + encoded_url
-            await trace(f"ABRINDO NoAdsDL: {direct_url}")
+            # Abre a página limpa. Passar ?url= faz o próprio site iniciar uma
+            # leitura automática e deixar "Reading video info…" ativo antes do clique,
+            # o que pode conflitar com o fluxo manual de Extract Formats.
+            direct_url = "https://noadsdl.com/youtube-video-downloader-online"
+            await trace(f"ABRINDO NoAdsDL SEM AUTOINÍCIO: {direct_url}")
             await page.goto(direct_url, wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1800)
             await trace(f"PÁGINA ABERTA: URL={page.url}; título={(await page.title())[:160]}")
@@ -335,11 +335,14 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
                 url_input = page.locator('input[type="url"], input[placeholder*="youtube" i], input[aria-label*="youtube" i]').first
                 if await url_input.count() and await url_input.is_visible() and await url_input.is_enabled():
                     current_value = (await url_input.input_value()).strip()
-                    if current_value != url:
-                        await url_input.fill(url, timeout=5000)
-                        await trace(f"CAMPO DE URL PREENCHIDO: antes={current_value[:120]!r}; depois={(await url_input.input_value())[:160]!r}")
-                    else:
-                        await trace("CAMPO DE URL JÁ CONTINHA O LINK CORRETO.")
+                    await url_input.fill(url, timeout=5000)
+                    # Dispara explicitamente input/change para páginas que não reagem
+                    # apenas à atribuição do valor no campo.
+                    await url_input.evaluate("""e => {
+                        e.dispatchEvent(new Event('input', {bubbles:true}));
+                        e.dispatchEvent(new Event('change', {bubbles:true}));
+                    }""")
+                    await trace(f"CAMPO DE URL PREENCHIDO E EVENTOS DISPARADOS: antes={current_value[:120]!r}; depois={(await url_input.input_value())[:160]!r}")
                 else:
                     await trace("CAMPO DE URL ESPECÍFICO NÃO ENCONTRADO; verificando inputs visíveis.")
                     visible_inputs = await page.locator("input").evaluate_all("""els => els.filter(e => {const r=e.getBoundingClientRect(),s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;}).map(e=>({type:e.type,placeholder:e.placeholder,aria:e.getAttribute('aria-label'),value:e.value})).slice(0,15)""")
@@ -349,13 +352,28 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
             if not initial_formats:
                 await trace("Não há botão de formato visível ainda; procurando botão para extrair/mostrar formatos.")
                 try:
-                    await click_named(page, [
-                        re.compile(r"show mp4\s*&\s*mp3 formats", re.I),
-                        re.compile(r"extract formats", re.I),
-                        re.compile(r"show formats", re.I),
-                        re.compile(r"continue to available formats", re.I),
-                        re.compile(r"available formats|formatos disponíveis", re.I),
-                    ], trace=trace)
+                    # Preferir o ID estável do botão real do NoAdsDL.
+                    extract_button = page.locator("#v3ExtractBtn")
+                    if await extract_button.count() and await extract_button.is_visible() and await extract_button.is_enabled():
+                        label = (await extract_button.inner_text()).strip().replace("\\n", " ")[:120]
+                        await trace(f"CLIQUE ÚNICO DIRETO NO ID #v3ExtractBtn: «{label}».")
+                        try:
+                            await extract_button.click(timeout=5000)
+                            await trace("CLIQUE NORMAL EM #v3ExtractBtn concluído.")
+                        except Exception as normal_exc:
+                            await trace(f"CLIQUE NORMAL NO ID FALHOU: {type(normal_exc).__name__}: {str(normal_exc)[:160]}; tentando force.")
+                            await extract_button.click(timeout=5000, force=True)
+                            await trace("CLIQUE FORÇADO EM #v3ExtractBtn concluído.")
+                        await page.wait_for_timeout(1000)
+                        await trace("APÓS CLIQUE DE EXTRAÇÃO: " + repr((await page.locator("body").inner_text())[:700]))
+                    else:
+                        await click_named(page, [
+                            re.compile(r"show mp4\\s*&\\s*mp3 formats", re.I),
+                            re.compile(r"extract formats", re.I),
+                            re.compile(r"show formats", re.I),
+                            re.compile(r"continue to available formats", re.I),
+                            re.compile(r"available formats|formatos disponíveis", re.I),
+                        ], trace=trace)
                 except RuntimeError as click_error:
                     await trace(f"NENHUM BOTÃO DE EXTRAÇÃO CLICADO: {click_error}")
                     # A página pode já ter começado a processar o parâmetro url sem mostrar o botão.

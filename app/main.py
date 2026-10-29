@@ -73,23 +73,29 @@ async def first_visible(locators):
 
 
 async def click_named(page, patterns, trace=None) -> None:
+    attempted = []
     for pattern in patterns:
         for role in ("button", "link"):
+            item = page.get_by_role(role, name=pattern).first
             try:
-                item = page.get_by_role(role, name=pattern).first
-                if await item.count() and await item.is_visible() and await item.is_enabled():
-                    label = (await item.inner_text()).strip().replace("\\n", " ")[:180]
-                    if trace:
-                        await trace(f"CLIQUE: {role} «{label or str(pattern)[:100]}». Executando clique…")
-                    await item.click(timeout=15000)
-                    await page.wait_for_timeout(1200)
-                    if trace:
-                        body_after = (await page.locator("body").inner_text())[:500]
-                        await trace(f"APÓS CLIQUE em «{label or str(pattern)[:100]}»: URL={page.url}; texto visível={body_after!r}")
-                    return
-            except Exception:
-                continue
-    raise RuntimeError("Não encontrei o botão 'Continue to available formats' no NoAdsDL. A interface pode ter mudado.")
+                if not await item.count() or not await item.is_visible() or not await item.is_enabled():
+                    continue
+                label = (await item.inner_text()).strip().replace("\\n", " ")[:180]
+                if any(label == old_label for old_label in attempted):
+                    continue
+                attempted.append(label)
+                if trace:
+                    await trace(f"CLIQUE ÚNICO: {role} «{label or str(pattern)[:100]}». Executando clique…")
+                await item.click(timeout=15000)
+                await page.wait_for_timeout(1500)
+                body_after = (await page.locator("body").inner_text())[:700]
+                if trace:
+                    await trace(f"RESULTADO DO CLIQUE: «{label or str(pattern)[:100]}»; URL={page.url}; texto visível={body_after!r}")
+                return
+            except Exception as exc:
+                if trace:
+                    await trace(f"FALHA AO CLICAR em «{str(pattern)[:100]}»: {type(exc).__name__}: {str(exc)[:180]}")
+    raise RuntimeError("Nenhum botão de extração pôde ser acionado. Tentativas: " + repr(attempted))
 
 
 async def click_largest_video_option(page, trace=None):
@@ -251,13 +257,13 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
                 return
             record_diagnostic(f"requestfailed: {req.method} {req.url[:220]} :: {(req.failure or '')[:100]}")
         def record_bad_response(res) -> None:
-            if res.status >= 400:
+            if res.status >= 400 or ("noadsdl.com/api/" in res.url.lower() and not any(x in res.url.lower() for x in ("/api/analytics/", "/api/future-updates/"))):
                 record_diagnostic(f"HTTP {res.status}: {res.request.method} {res.url[:240]}")
         page.on("console", lambda msg: record_diagnostic(f"console[{msg.type}]: {msg.text[:240]}") if msg.type == "error" else None)
         page.on("pageerror", lambda exc: record_diagnostic(f"pageerror: {str(exc)[:240]}"))
         page.on("requestfailed", record_failed_request)
         page.on("response", record_bad_response)
-        page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if "noadsdl.com/api/" in req.url.lower() and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/")) else None)
+        page.on("request", lambda req: record_diagnostic(f"request: {req.method} {req.url[:240]}") if ("noadsdl.com/api/" in req.url.lower() or req.method.upper() not in ("GET", "HEAD")) and not any(x in req.url.lower() for x in ("/api/analytics/", "/api/future-updates/", "google-analytics.com", "/cdn-cgi/rum")) else None)
         try:
             # Vai direto à rota de download e passa o link do YouTube no parâmetro url.
             # Isso pula a página inicial e a etapa manual de colar o link.
@@ -301,7 +307,6 @@ async def download_from_noadsdl(url: str, target: Path, jid: str) -> None:
                         re.compile(r"show mp4\s*&\s*mp3 formats", re.I),
                         re.compile(r"extract formats", re.I),
                         re.compile(r"show formats", re.I),
-                        re.compile(r"extract formats", re.I),
                         re.compile(r"continue to available formats", re.I),
                         re.compile(r"available formats|formatos disponíveis", re.I),
                     ], trace=trace)

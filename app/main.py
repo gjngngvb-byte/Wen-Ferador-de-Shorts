@@ -263,30 +263,35 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
             except PlaywrightTimeoutError:
                 pass
 
-            # NoAdsDL may show "Reading video info…" while it resolves the source.
+            # Aguarda os formatos reais aparecerem. O NoAdsDL pode manter o texto
+            # "Reading video info…" mesmo depois de renderizar os botões.
             deadline = asyncio.get_running_loop().time() + 75
             last_body = ""
             while asyncio.get_running_loop().time() < deadline:
                 try:
-                    last_body = (await page.locator("body").inner_text())[:2500]
+                    last_body = (await page.locator("body").inner_text())[:3000]
                 except Exception:
                     last_body = ""
-                reading = re.search(r"reading video info|extracting formats|please wait", last_body, re.I)
                 found_format = await page.locator(
                     'a, button, [role="button"], input[type="radio"], label'
                 ).evaluate_all("""els => els.some(e => {
-                    const t = [e.innerText, e.value, e.getAttribute('aria-label'), e.title].filter(Boolean).join(' ');
-                    return /(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p|\\b(?:4k|8k)\\b/i.test(t)
-                      && t.length < 90 && !/[?]/.test(t)
+                    const t = [e.innerText, e.value, e.getAttribute('aria-label'), e.title]
+                      .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    const visible = !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+                    const enabled = !e.disabled && e.getAttribute('aria-disabled') !== 'true';
+                    return visible && enabled
+                      && /(?:144|240|360|480|540|576|720|1080|1440|2160|4320)\\s*p/i.test(t)
+                      && /\\bMP4\\b/i.test(t)
+                      && t.length < 120 && !/[?]/.test(t)
                       && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
                 })""")
-                if found_format and not reading:
+                if found_format:
                     break
                 await page.wait_for_timeout(1000)
             else:
                 diagnostic_tail = " | Diagnóstico do navegador: " + repr(browser_diagnostics[-12:])
                 raise RuntimeError(
-                    "O NoAdsDL não terminou de extrair os formatos em 75 segundos. "
+                    "O NoAdsDL não exibiu um botão de vídeo MP4 em 75 segundos. "
                     "Último texto visível: " + repr(last_body[:900]) + diagnostic_tail
                 )
             download, _description = await click_largest_video_option(page)

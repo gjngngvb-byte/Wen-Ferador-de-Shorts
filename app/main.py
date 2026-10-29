@@ -245,7 +245,7 @@ async def download_from_noadsdl(url: str, target: Path) -> None:
                   && t.length < 90 && !/[?]/.test(t)
                   && !/why|faq|longer|audio|mp3|learn more|support/i.test(t);
             })""")
-            if not already_processing and not initial_formats:
+            if not initial_formats:
                 try:
                     await click_named(page, [
                         re.compile(r"show mp4\s*&\s*mp3 formats", re.I),
